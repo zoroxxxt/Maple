@@ -5,7 +5,7 @@
 <div align="center">
     <a href="https://twitter.com/HiTw93" target="_blank">
     <img alt="twitter" src="https://img.shields.io/badge/follow-Tw93-red?style=flat-square&logo=Twitter"></a>
-    <a href="https://t.me/+GclQS9ZnxyI2ODQ1" target="_blank">
+    <a href="https://t.me/+9f9gf4ZrFSQ2OWVl" target="_blank">
     <img alt="telegram" src="https://img.shields.io/badge/chat-telegram-blueviolet?style=flat-square&logo=Telegram"></a>
     <a href="https://github.com/tw93/Maple/commits" target="_blank">
     <img alt="GitHub commit" src="https://img.shields.io/github/commit-activity/m/tw93/Maple?style=flat-square"></a>
@@ -59,7 +59,7 @@ The bookmarks bar can occupy the browsing window and affect concentration, so I 
 
 Since the default new theme of Chrome is not very appealing to me, I prefer a simple and clean effect, so I developed a [Maple Theme](https://chromewebstore.google.com/detail/cghofkeabdkcdoanmjhkadklfdlelaao) on the side. It doesn't include any other messy colors, making your browser look very clean.
 
-<img src="https://cdn.fliggy.com/upic/acV6PC.png" width="100%" />
+<img src="https://raw.githubusercontent.com/tw93/Maple/main/white-theme.png" width="100%" />
 
 ## Practice
 
