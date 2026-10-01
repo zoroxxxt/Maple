@@ -9,6 +9,7 @@ import { ICONS } from "./utils/icons.js";
 import { getCategoryIcon } from "./utils/category-icons.js";
 import { enableDragSort } from "./utils/drag-sort.js";
 import { createNoteTooltip, createNoteEditor } from "./utils/note-ui.js";
+import { createSitePreview, clearPreviews } from "./utils/site-preview.js";
 
 // 设置相关常量
 const SETTINGS_KEYS = {
@@ -211,6 +212,23 @@ setTimeout(() => {
 }, 0);
 
 const noteTooltip = createNoteTooltip();
+const sitePreview = createSitePreview();
+
+// Page previews (opt-in): background.js saves the screenshots, this page only shows them
+const PREVIEWS_KEY = "MAPLE_PREVIEWS";
+const ALL_URLS = { origins: ["<all_urls>"] };
+let previewsOn = false;
+chrome.storage.local.get(PREVIEWS_KEY).then(
+  (result) => {
+    previewsOn = result[PREVIEWS_KEY] === true;
+  },
+  () => {}
+);
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes[PREVIEWS_KEY]) return;
+  previewsOn = changes[PREVIEWS_KEY].newValue === true;
+  if (!previewsOn) sitePreview.hide();
+});
 const noteEditor = createNoteEditor({ getNote, saveNote, onDelete: deleteBookmark });
 
 // Settings overlay: pop-up + sidebar içinde overlay olarak ayarlar paneli
@@ -233,6 +251,8 @@ const SETTINGS_OVERLAY = {
           "search-desc": "显示搜索框以快速查找书签。",
           "short-title": "简短名称",
           "short-desc": "只显示网站名称（如 youtube），不显示完整网页标题。",
+          "previews-title": "网页预览",
+          "previews-desc": "鼠标悬停卡片即可预览网站。打开已收藏的网站时，会在本机保存一张小截图。",
           "tips-title": "悬停提示",
           "tips-desc": "鼠标悬停时显示完整书签标题。",
           "newtab-title": "新标签页打开",
@@ -249,6 +269,9 @@ const SETTINGS_OVERLAY = {
           "search-desc": "Show search box to quickly find bookmarks.",
           "short-title": "Short Names",
           "short-desc": "Show only the site name, like youtube, instead of the full page title.",
+          "previews-title": "Page Previews",
+          "previews-desc":
+            "Hover a card to see the site. A small screenshot is saved on this device when you open a bookmarked site.",
           "tips-title": "Hover Tooltips",
           "tips-desc": "Show full bookmark titles on hover.",
           "newtab-title": "Open in New Tab",
@@ -270,6 +293,7 @@ const SETTINGS_OVERLAY = {
     const sidebar = document.getElementById("overlaySidebarMode");
     const search = document.getElementById("overlaySearchEnabled");
     const shortNames = document.getElementById("overlayShortNames");
+    const previews = document.getElementById("overlayPreviews");
     const tips = document.getElementById("overlayTipsEnabled");
     const newtab = document.getElementById("overlayOpenInNewTab");
     const keep = document.getElementById("overlayKeepPanelOpen");
@@ -292,6 +316,26 @@ const SETTINGS_OVERLAY = {
       shortNames.addEventListener("change", () => {
         localStorage.setItem(SETTINGS_KEYS.SHORT_NAMES, shortNames.checked.toString());
         if (latestTree) renderBookmarkTree(latestTree);
+      });
+    }
+    if (previews) {
+      previews.addEventListener("change", () => {
+        if (previews.checked) {
+          // The permission prompt needs this click, so ask before any await. The
+          // setting is saved first: a popup can close while the prompt is open.
+          const request = chrome.permissions.request(ALL_URLS);
+          chrome.storage.local.set({ [PREVIEWS_KEY]: true });
+          const turnOff = () => {
+            previews.checked = false;
+            chrome.storage.local.set({ [PREVIEWS_KEY]: false });
+          };
+          request.then((granted) => granted || turnOff(), turnOff);
+        } else {
+          // Off removes the saved screenshots and gives the permission back
+          chrome.storage.local.set({ [PREVIEWS_KEY]: false });
+          clearPreviews().then(() => sitePreview.forget());
+          chrome.permissions.remove(ALL_URLS).catch(() => {});
+        }
       });
     }
     if (tips) {
@@ -330,6 +374,16 @@ const SETTINGS_OVERLAY = {
 
     if (search) search.checked = localStorage.getItem(SETTINGS_KEYS.SEARCH_ENABLED) === "true";
     if (shortNames) shortNames.checked = isShortNamesEnabled();
+    const previews = document.getElementById("overlayPreviews");
+    if (previews) {
+      previews.checked = false;
+      Promise.all([chrome.storage.local.get(PREVIEWS_KEY), chrome.permissions.contains(ALL_URLS)]).then(
+        ([result, granted]) => {
+          previews.checked = result[PREVIEWS_KEY] === true && granted;
+        },
+        () => {}
+      );
+    }
     if (tips) tips.checked = localStorage.getItem(SETTINGS_KEYS.TIPS_ENABLED) === "true";
     if (newtab) newtab.checked = localStorage.getItem(SETTINGS_KEYS.OPEN_IN_NEW_TAB) !== "false";
     if (keep) keep.checked = localStorage.getItem(SETTINGS_KEYS.KEEP_PANEL_OPEN) === "true";
@@ -900,9 +954,17 @@ document.addEventListener("mouseover", function (event) {
     noteTooltip.show(info, getNote(info.closest(".bookmark").getAttribute("href")));
   }
 
+  // The info icon has its own tooltip (the note)
+  if (info) sitePreview.hide();
+
   const card = getCardFromEvent(event);
   if (card === hoveredCard) return;
   hoveredCard = card;
+  if (card && previewsOn && !info && !document.body.matches(".is-dragging-card, .is-dragging-folder")) {
+    sitePreview.show(card, hostOf(card));
+  } else {
+    sitePreview.hide();
+  }
   // 只有在文本溢出且 tips 功能开启的时候才做处理
   if (!card || !isTipsEnabled()) return;
   const label = card.querySelector("p");
@@ -925,6 +987,7 @@ document.addEventListener("mouseout", function (event) {
   const card = target?.closest(".bookmark");
   if (!card || card.contains(next)) return;
   hoveredCard = null;
+  sitePreview.hide();
   if (!isTipsEnabled()) return;
   if (hideTimeout) clearTimeout(hideTimeout);
   // 在mouseleave事件中，设置一个延时，然后隐藏Notification
@@ -933,7 +996,18 @@ document.addEventListener("mouseout", function (event) {
   }, 500);
 });
 
-document.addEventListener("mousedown", () => noteTooltip.hide());
+document.addEventListener("mousedown", () => {
+  noteTooltip.hide();
+  sitePreview.hide();
+});
+
+function hostOf(card) {
+  try {
+    return new URL(card.getAttribute("href")).hostname;
+  } catch {
+    return "";
+  }
+}
 
 // The toolbar stays on top (sticky); show its bottom line once the list scrolls
 // The toolbar and the bottom menu show a thin line when the list continues behind them
@@ -947,6 +1021,7 @@ window.addEventListener(
   "scroll",
   () => {
     noteTooltip.hide();
+    sitePreview.hide();
     updateBarBorders();
   },
   { passive: true }
@@ -1031,6 +1106,9 @@ async function addCurrentPage(firefoxPermission = null) {
     const parentId = tree?.[0]?.children?.[0]?.id ?? "1";
     const node = await chrome.bookmarks.create({ parentId, index: 0, title: tab.title || "", url });
     pendingRevealId = node.id;
+    if (previewsOn && Number.isInteger(tab.id)) {
+      chrome.runtime.sendMessage({ type: "MAPLE_CAPTURE_PREVIEW", tabId: tab.id }).catch(() => {});
+    }
     Notification.show(TEXT.added, 2200);
   } catch (error) {
     console.warn("Failed to add bookmark:", error);
@@ -1192,6 +1270,7 @@ function renderBookmarkTree(bookmarkTreeNodes) {
   const scroller = document.scrollingElement || document.documentElement;
   const scrollTop = scroller.scrollTop;
   noteTooltip.hide();
+  sitePreview.hide();
   hoveredCard = null;
 
   createBookmarks(bookmarkTreeNodes);

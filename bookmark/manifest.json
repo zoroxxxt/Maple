@@ -27,6 +27,7 @@
       "description": "Open or close the sidebar"
     }
   },
+  "optional_host_permissions": ["<all_urls>"],
   "optional_permissions": ["tabs"],
   "permissions": ["activeTab", "bookmarks", "favicon", "sidePanel", "storage"],
   "options_page": "settings.html",

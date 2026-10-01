@@ -122,3 +122,153 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return true;
 });
+
+// ---- Page previews ----
+// Opt-in (setting + the optional "<all_urls>" permission). When the user opens a
+// bookmarked site, take one small screenshot of the visible tab and keep it in
+// IndexedDB on this device. Cards show it on hover (utils/site-preview.js).
+// No network requests; at most one capture per site every few days.
+const PREVIEWS_KEY = "MAPLE_PREVIEWS";
+const PREVIEW_DB = "maple-previews";
+const PREVIEW_STORE = "previews";
+const PREVIEW_WIDTH = 480;
+const PREVIEW_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
+// Wait for the page to finish drawing after "complete"
+const PREVIEW_DELAY_MS = 1500;
+const ALL_URLS = { origins: ["<all_urls>"] };
+
+let previewsOn = null;
+let bookmarkedHosts = null;
+const captureTimers = new Map();
+
+async function arePreviewsOn() {
+  if (previewsOn === null) {
+    try {
+      const stored = (await chrome.storage.local.get(PREVIEWS_KEY))[PREVIEWS_KEY] === true;
+      previewsOn = stored && (await chrome.permissions.contains(ALL_URLS));
+    } catch {
+      previewsOn = false;
+    }
+  }
+  return previewsOn;
+}
+
+function openPreviewDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(PREVIEW_DB, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore(PREVIEW_STORE, { keyPath: "host" });
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function previewDb(mode, run) {
+  const db = await openPreviewDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(PREVIEW_STORE, mode);
+      const request = run(tx.objectStore(PREVIEW_STORE));
+      tx.oncomplete = () => resolve(request.result);
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function getBookmarkedHosts() {
+  if (!bookmarkedHosts) {
+    const hosts = new Set();
+    const walk = (nodes) => {
+      for (const node of nodes) {
+        if (node.url) {
+          try {
+            hosts.add(new URL(node.url).hostname);
+          } catch {
+            // not a web address
+          }
+        }
+        if (node.children) walk(node.children);
+      }
+    };
+    walk(await chrome.bookmarks.getTree());
+    bookmarkedHosts = hosts;
+  }
+  return bookmarkedHosts;
+}
+
+for (const eventName of ["onCreated", "onRemoved", "onChanged", "onImportEnded"]) {
+  chrome.bookmarks?.[eventName]?.addListener(() => {
+    bookmarkedHosts = null;
+  });
+}
+
+// The full screenshot is the size of the window (often 2x); keep a small JPEG
+async function shrinkScreenshot(dataUrl) {
+  const source = await (await fetch(dataUrl)).blob();
+  const bitmap = await createImageBitmap(source, { resizeWidth: PREVIEW_WIDTH, resizeQuality: "medium" });
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  canvas.getContext("2d").drawImage(bitmap, 0, 0);
+  bitmap.close();
+  return canvas.convertToBlob({ type: "image/jpeg", quality: 0.72 });
+}
+
+async function capturePreview(tabId, force = false) {
+  try {
+    if (!(await arePreviewsOn())) return false;
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.active || tab.incognito || !/^https?:/i.test(tab.url || "")) return false;
+    const host = new URL(tab.url).hostname;
+    if (!(await getBookmarkedHosts()).has(host)) return false;
+    if (!force) {
+      const saved = await previewDb("readonly", (store) => store.get(host));
+      if (saved && Date.now() - saved.capturedAt < PREVIEW_MAX_AGE_MS) return false;
+    }
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 80 });
+    const blob = await shrinkScreenshot(dataUrl);
+    await previewDb("readwrite", (store) => store.put({ host, blob, capturedAt: Date.now() }));
+    return true;
+  } catch {
+    // A browser page, a minimized window, or no permission: no preview this time
+    return false;
+  }
+}
+
+function onTabUpdated(tabId, changeInfo, tab) {
+  if (changeInfo.status !== "complete" || !tab.active) return;
+  clearTimeout(captureTimers.get(tabId));
+  captureTimers.set(
+    tabId,
+    setTimeout(() => {
+      captureTimers.delete(tabId);
+      capturePreview(tabId);
+    }, PREVIEW_DELAY_MS)
+  );
+}
+
+// Registered at the top level, so a page load can wake this worker. With previews
+// off, the listener is removed again, so page loads do not wake it for nothing.
+chrome.tabs.onUpdated.addListener(onTabUpdated);
+
+async function syncPreviewListener() {
+  previewsOn = null;
+  const on = await arePreviewsOn();
+  const listening = chrome.tabs.onUpdated.hasListener(onTabUpdated);
+  if (on && !listening) chrome.tabs.onUpdated.addListener(onTabUpdated);
+  if (!on && listening) chrome.tabs.onUpdated.removeListener(onTabUpdated);
+}
+syncPreviewListener();
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes[PREVIEWS_KEY]) syncPreviewListener();
+});
+chrome.permissions?.onAdded?.addListener(syncPreviewListener);
+chrome.permissions?.onRemoved?.addListener(syncPreviewListener);
+
+// "+" (add current page) asks for a preview of that tab right away
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "MAPLE_CAPTURE_PREVIEW" || !Number.isInteger(message.tabId)) return false;
+  bookmarkedHosts = null;
+  capturePreview(message.tabId, true).then((captured) => sendResponse({ captured }));
+  return true;
+});

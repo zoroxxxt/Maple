@@ -1152,6 +1152,43 @@ body.is-searching .childContainer {
   }
 }
 
+/* ======= Site preview (hover on a card): a saved screenshot of the site ======= */
+.site-preview {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 310;
+  width: min(300px, calc(100vw - 16px));
+  box-sizing: border-box;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--maple-card);
+  border: 1px solid var(--maple-border);
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.32),
+    0 2px 8px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(4px) scale(0.98);
+  transition:
+    opacity 0.14s ease,
+    transform 0.14s ease,
+    visibility 0.14s;
+}
+
+.site-preview.show {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+}
+
+.site-preview img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
 /* ======= Note editor (click on a card's info icon) ======= */
 .note-editor {
   position: fixed;
