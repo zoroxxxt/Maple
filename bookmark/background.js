@@ -46,6 +46,28 @@ chrome.action.onClicked.addListener(async () => {
   }
 });
 
+// Cmd/Ctrl+B toggles the sidebar in the window of the shortcut.
+// There is no API to ask whether the panel is open, so open() always runs
+// (no change when it is open already), and a sidebar that was open before
+// closes itself on the message below. A sidebar that open() just started is
+// still loading, so it does not get the message and stays open.
+function toggleSidebar(tab) {
+  const windowId = tab?.windowId;
+  if (!chrome.sidePanel?.open || windowId === undefined) {
+    globalThis.browser?.sidebarAction?.toggle?.();
+    return;
+  }
+  // open() needs the shortcut's user gesture, so it must run inside this listener
+  chrome.sidePanel.open({ windowId }).catch((e) => console.warn("Failed to open side panel:", e));
+  chrome.runtime.sendMessage({ type: "MAPLE_TOGGLE_SIDEBAR", windowId }).catch(() => {
+    // No sidebar was open to receive it
+  });
+}
+
+chrome.commands?.onCommand.addListener((command, tab) => {
+  if (command === "toggle-sidebar") toggleSidebar(tab);
+});
+
 async function init() {
   const mode = await getStoredMode();
   await applyMode(mode);
@@ -54,6 +76,26 @@ async function init() {
 chrome.runtime.onInstalled.addListener(init);
 chrome.runtime.onStartup.addListener(init);
 
+// Opens the action popup. Chrome 127+ needs no user gesture for this, but the
+// window must be active and applyMode() must have set the popup first.
+async function openActionPopup(windowId) {
+  if (!chrome.action?.openPopup) return false;
+  try {
+    if (Number.isInteger(windowId)) {
+      await chrome.action.openPopup({ windowId });
+    } else {
+      await chrome.action.openPopup();
+    }
+    return true;
+  } catch (e) {
+    console.warn("Failed to open popup:", e);
+    return false;
+  }
+}
+
+// The side panel is not opened here: sidePanel.open() needs the click's user
+// gesture, and the gesture does not survive the message to this worker.
+// The popup page opens it itself (see switchToSidebar in popup.js).
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.type !== "MAPLE_SET_MODE") {
     return false;
@@ -62,72 +104,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const nextMode = message.mode === MODE_SIDEBAR ? MODE_SIDEBAR : MODE_POPUP;
 
   (async () => {
-    await chrome.storage.local.set({ [MODE_KEY]: nextMode });
-    await applyMode(nextMode);
+    let opened = false;
+    try {
+      // Apply first, so the icon already opens the new mode when other open
+      // panels see the storage change and close.
+      await applyMode(nextMode);
+      await chrome.storage.local.set({ [MODE_KEY]: nextMode });
 
-    if (message.openImmediately) {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-      if (nextMode === MODE_SIDEBAR) {
-        try {
-          if (chrome.sidePanel?.open && tab) {
-            await chrome.sidePanel.open({ windowId: tab.windowId });
-          } else {
-            const sidebarApi = globalThis.browser?.sidebarAction;
-            if (sidebarApi?.open) {
-              await sidebarApi.open();
-            }
-          }
-        } catch (e) {
-          console.warn("Failed to open side panel:", e);
-        }
-      } else if (nextMode === MODE_POPUP) {
-        // Sidebar -> popup geçişi: önce action.openPopup dene (Chrome 127+),
-        // başarısız olursa standalone popup penceresi aç (her Chrome sürümünde çalışır).
-        let opened = false;
-        try {
-          if (chrome.action?.openPopup) {
-            await chrome.action.openPopup();
-            opened = true;
-          }
-        } catch (e) {
-          console.warn("chrome.action.openPopup failed, falling back:", e);
-        }
-
-        if (!opened) {
-          try {
-            const w = tab ? await chrome.windows.get(tab.windowId) : null;
-            const popupWidth = 420;
-            const popupHeight = 540;
-            const left = w ? Math.max(0, (w.left || 0) + (w.width || 800) - popupWidth - 24) : undefined;
-            const top = w ? (w.top || 0) + 80 : undefined;
-            await chrome.windows.create({
-              url: chrome.runtime.getURL("popup.html"),
-              type: "popup",
-              width: popupWidth,
-              height: popupHeight,
-              focused: true,
-              ...(left !== undefined ? { left } : {}),
-              ...(top !== undefined ? { top } : {}),
-            });
-          } catch (e) {
-            console.warn("Failed to open popup window fallback:", e);
-          }
-        }
-
-        // Firefox sidebar'ı için açıkça kapat
-        try {
-          const sidebarApi = globalThis.browser?.sidebarAction;
-          if (sidebarApi?.close) {
-            await sidebarApi.close();
-          }
-        } catch (e) {
-          console.warn("Failed to close Firefox sidebar:", e);
-        }
+      if (nextMode === MODE_POPUP && message.openPopup) {
+        opened = await openActionPopup(message.windowId);
       }
+    } catch (e) {
+      console.warn("Failed to switch display mode:", e);
     }
-
-    sendResponse({ ok: true, mode: nextMode });
+    sendResponse({ ok: true, mode: nextMode, opened });
   })();
 
   return true;
