@@ -9,7 +9,7 @@ import { ICONS } from "./utils/icons.js";
 import { getCategoryIcon } from "./utils/category-icons.js";
 import { enableDragSort } from "./utils/drag-sort.js";
 import { createNoteTooltip, createNoteEditor } from "./utils/note-ui.js";
-import { createSitePreview, clearPreviews } from "./utils/site-preview.js";
+import { createSitePreview, clearPreviews, countPreviews } from "./utils/site-preview.js";
 
 // 设置相关常量
 const SETTINGS_KEYS = {
@@ -252,7 +252,11 @@ const SETTINGS_OVERLAY = {
           "short-title": "简短名称",
           "short-desc": "只显示网站名称（如 youtube），不显示完整网页标题。",
           "previews-title": "网页预览",
-          "previews-desc": "鼠标悬停卡片即可预览网站。打开已收藏的网站时，会在本机保存一张小截图。",
+          "previews-desc":
+            "鼠标悬停卡片即可预览网站。打开已收藏的网站时，会在本机保存一张小截图；在此之前显示网站自己的分享图。",
+          previewsStatus: (shots, images) => `已保存 ${shots} 张截图、${images} 张分享图。`,
+          previewsEmpty: "还没有预览。打开一个已收藏的网站，或把鼠标移到卡片上。",
+          previewsError: (message) => `截图失败：${message}`,
           "tips-title": "悬停提示",
           "tips-desc": "鼠标悬停时显示完整书签标题。",
           "newtab-title": "新标签页打开",
@@ -271,7 +275,10 @@ const SETTINGS_OVERLAY = {
           "short-desc": "Show only the site name, like youtube, instead of the full page title.",
           "previews-title": "Page Previews",
           "previews-desc":
-            "Hover a card to see the site. A small screenshot is saved on this device when you open a bookmarked site.",
+            "Hover a card to see the site. Opening a bookmarked site saves a small screenshot on this device. Until then, the site's own share image is shown.",
+          previewsStatus: (shots, images) => `Saved: ${shots} screenshots, ${images} share images.`,
+          previewsEmpty: "No previews yet. Open a bookmarked site, or hover a card.",
+          previewsError: (message) => `Screenshot failed: ${message}`,
           "tips-title": "Hover Tooltips",
           "tips-desc": "Show full bookmark titles on hover.",
           "newtab-title": "Open in New Tab",
@@ -279,6 +286,7 @@ const SETTINGS_OVERLAY = {
           "keep-title": "Keep Panel Open",
           "keep-desc": "Open in background tabs to keep the panel visible.",
         };
+    this.i18n = i18n;
     const titleEl = document.getElementById("settingsOverlayTitle");
     if (titleEl) titleEl.textContent = i18n.title;
     const backEl = document.getElementById("settingsOverlayBack");
@@ -329,11 +337,12 @@ const SETTINGS_OVERLAY = {
             previews.checked = false;
             chrome.storage.local.set({ [PREVIEWS_KEY]: false });
           };
-          request.then((granted) => granted || turnOff(), turnOff);
+          request.then((granted) => (granted ? setTimeout(() => this.showPreviewStatus(), 2500) : turnOff()), turnOff);
         } else {
           // Off removes the saved screenshots and gives the permission back
           chrome.storage.local.set({ [PREVIEWS_KEY]: false });
           clearPreviews().then(() => sitePreview.forget());
+          this.showPreviewStatus();
           chrome.permissions.remove(ALL_URLS).catch(() => {});
         }
       });
@@ -380,6 +389,7 @@ const SETTINGS_OVERLAY = {
       Promise.all([chrome.storage.local.get(PREVIEWS_KEY), chrome.permissions.contains(ALL_URLS)]).then(
         ([result, granted]) => {
           previews.checked = result[PREVIEWS_KEY] === true && granted;
+          this.showPreviewStatus();
         },
         () => {}
       );
@@ -404,6 +414,25 @@ const SETTINGS_OVERLAY = {
     requestAnimationFrame(() => {
       if (this.el) this.el.classList.add("open");
     });
+  },
+  // Under "Page Previews": how many sites have a preview, and the last screenshot error
+  async showPreviewStatus() {
+    const status = document.getElementById("previewsStatus");
+    const previews = document.getElementById("overlayPreviews");
+    if (!status || !this.i18n) return;
+    if (!previews?.checked) {
+      status.textContent = "";
+      return;
+    }
+    const [{ screenshots, shareImages }, stored] = await Promise.all([
+      countPreviews(),
+      chrome.storage.local.get("MAPLE_PREVIEW_ERROR").catch(() => ({})),
+    ]);
+    const lines = [
+      screenshots || shareImages ? this.i18n.previewsStatus(screenshots, shareImages) : this.i18n.previewsEmpty,
+    ];
+    if (stored.MAPLE_PREVIEW_ERROR) lines.push(this.i18n.previewsError(stored.MAPLE_PREVIEW_ERROR));
+    status.textContent = lines.join(" ");
   },
   close() {
     if (!this.el) return;
@@ -961,7 +990,7 @@ document.addEventListener("mouseover", function (event) {
   if (card === hoveredCard) return;
   hoveredCard = card;
   if (card && previewsOn && !info && !document.body.matches(".is-dragging-card, .is-dragging-folder")) {
-    sitePreview.show(card, hostOf(card));
+    sitePreview.show(card, card.getAttribute("href"));
   } else {
     sitePreview.hide();
   }
@@ -1000,14 +1029,6 @@ document.addEventListener("mousedown", () => {
   noteTooltip.hide();
   sitePreview.hide();
 });
-
-function hostOf(card) {
-  try {
-    return new URL(card.getAttribute("href")).hostname;
-  } catch {
-    return "";
-  }
-}
 
 // The toolbar stays on top (sticky); show its bottom line once the list scrolls
 // The toolbar and the bottom menu show a thin line when the list continues behind them

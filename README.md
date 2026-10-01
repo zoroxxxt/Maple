@@ -80,7 +80,7 @@ Since the default new theme of Chrome is not very appealing to me, I prefer a si
 15. Click the arrows icon in the bottom bar to collapse or expand all folders. You can also hold `Option`(Mac)、`Alt`(Windows) and click a folder title.
 16. The bottom bar also has the switch between popup and sidebar, and the settings.
 17. With one or two categories open, the other categories blur, so you can focus on the open ones. With three or more open, nothing blurs.
-18. To see a site when you move the pointer over its card, turn on Page Previews in the settings. The browser asks once for access to all sites, because the extension takes a small screenshot of a bookmarked site when you open it. The screenshots stay on this device. Turn the setting off to delete them.
+18. To see a site when you move the pointer over its card, turn on Page Previews in the settings. The browser asks once for access to all sites, because the extension needs it for screenshots and share images. When you open a bookmarked site, the extension takes a small screenshot of it. Until then, the card shows the site's share image (the picture for link previews), which the extension downloads once without cookies. The previews stay on this device. A line under the setting shows the number of saved previews and the last screenshot error. Turn the setting off to delete the previews.
 
 ## Support
 

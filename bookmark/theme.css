@@ -1047,6 +1047,17 @@ body.is-searching .childContainer {
   line-height: 1.45;
 }
 
+.setting-status {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--maple-text-muted);
+}
+
+.setting-status:empty {
+  display: none;
+}
+
 .maple-switch {
   position: relative;
   display: inline-block;

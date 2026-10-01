@@ -124,22 +124,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // ---- Page previews ----
-// Opt-in (setting + the optional "<all_urls>" permission). When the user opens a
-// bookmarked site, take one small screenshot of the visible tab and keep it in
-// IndexedDB on this device. Cards show it on hover (utils/site-preview.js).
-// No network requests; at most one capture per site every few days.
+// Opt-in (setting + the optional "<all_urls>" permission). When the user opens or
+// switches to a bookmarked site, take one small screenshot of the visible tab and
+// keep it in IndexedDB on this device. Cards show it on hover (utils/site-preview.js).
+// No network requests here; at most one screenshot per site every few days.
 const PREVIEWS_KEY = "MAPLE_PREVIEWS";
+// The last screenshot error, shown in the settings ("" after a success)
+const PREVIEW_ERROR_KEY = "MAPLE_PREVIEW_ERROR";
 const PREVIEW_DB = "maple-previews";
 const PREVIEW_STORE = "previews";
 const PREVIEW_WIDTH = 480;
 const PREVIEW_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
-// Wait for the page to finish drawing after "complete"
+// Wait for the page to finish drawing after "complete" or a tab switch
 const PREVIEW_DELAY_MS = 1500;
+const CAPTURE_GAP_MS = 600;
 const ALL_URLS = { origins: ["<all_urls>"] };
 
 let previewsOn = null;
 let bookmarkedHosts = null;
 const captureTimers = new Map();
+
+// "www.example.com" and "example.com" are the same site for previews
+const previewHost = (hostname) => hostname.toLowerCase().replace(/^www\./, "");
 
 async function arePreviewsOn() {
   if (previewsOn === null) {
@@ -183,7 +189,7 @@ async function getBookmarkedHosts() {
       for (const node of nodes) {
         if (node.url) {
           try {
-            hosts.add(new URL(node.url).hostname);
+            hosts.add(previewHost(new URL(node.url).hostname));
           } catch {
             // not a web address
           }
@@ -213,49 +219,104 @@ async function shrinkScreenshot(dataUrl) {
   return canvas.convertToBlob({ type: "image/jpeg", quality: 0.72 });
 }
 
+// The preview host of a tab that shows a web page, or ""
+function tabHost(tab) {
+  if (!tab || !/^https?:/i.test(tab.url || "")) return "";
+  try {
+    return previewHost(new URL(tab.url).hostname);
+  } catch {
+    return "";
+  }
+}
+
 async function capturePreview(tabId, force = false) {
+  let host;
+  let windowId;
   try {
     if (!(await arePreviewsOn())) return false;
     const tab = await chrome.tabs.get(tabId);
-    if (!tab.active || tab.incognito || !/^https?:/i.test(tab.url || "")) return false;
-    const host = new URL(tab.url).hostname;
+    windowId = tab.windowId;
+    host = tabHost(tab);
+    if (!tab.active || tab.incognito || !host) return false;
     if (!(await getBookmarkedHosts()).has(host)) return false;
     if (!force) {
+      // A share image (fetched on hover) is replaced by a real screenshot at once
       const saved = await previewDb("readonly", (store) => store.get(host));
-      if (saved && Date.now() - saved.capturedAt < PREVIEW_MAX_AGE_MS) return false;
+      if (saved?.source === "screenshot" && Date.now() - saved.capturedAt < PREVIEW_MAX_AGE_MS) return false;
     }
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 80 });
-    const blob = await shrinkScreenshot(dataUrl);
-    await previewDb("readwrite", (store) => store.put({ host, blob, capturedAt: Date.now() }));
-    return true;
   } catch {
-    // A browser page, a minimized window, or no permission: no preview this time
+    return false;
+  }
+  try {
+    const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "jpeg", quality: 80 });
+    // The user can switch tabs during the capture: keep only a picture of this site
+    const after = await chrome.tabs.get(tabId).catch(() => null);
+    if (!after?.active || tabHost(after) !== host) return false;
+    const blob = await shrinkScreenshot(dataUrl);
+    await previewDb("readwrite", (store) => store.put({ host, blob, capturedAt: Date.now(), source: "screenshot" }));
+    chrome.storage.local.set({ [PREVIEW_ERROR_KEY]: "" }).catch(() => {});
+    return true;
+  } catch (error) {
+    // For example a minimized window, a page the browser protects, or a browser
+    // without screenshot support. The settings show the last error.
+    const message = String(error?.message || error);
+    console.warn("Maple: no screenshot for", host, message);
+    chrome.storage.local.set({ [PREVIEW_ERROR_KEY]: message }).catch(() => {});
     return false;
   }
 }
 
-function onTabUpdated(tabId, changeInfo, tab) {
-  if (changeInfo.status !== "complete" || !tab.active) return;
+// One capture at a time, with a pause between them: the browser allows only two
+// screenshots per second
+let captureQueue = Promise.resolve();
+function queueCapture(tabId, force = false) {
+  const run = captureQueue.then(() => capturePreview(tabId, force));
+  captureQueue = run.then(() => new Promise((resolve) => setTimeout(resolve, CAPTURE_GAP_MS)));
+  return run;
+}
+
+function scheduleCapture(tabId) {
   clearTimeout(captureTimers.get(tabId));
   captureTimers.set(
     tabId,
     setTimeout(() => {
       captureTimers.delete(tabId);
-      capturePreview(tabId);
+      queueCapture(tabId);
     }, PREVIEW_DELAY_MS)
   );
 }
 
-// Registered at the top level, so a page load can wake this worker. With previews
-// off, the listener is removed again, so page loads do not wake it for nothing.
+function onTabUpdated(tabId, changeInfo, tab) {
+  if (changeInfo.status === "complete" && tab.active) scheduleCapture(tabId);
+}
+
+// Tabs that were open before (or loaded in the background) get a screenshot when shown
+function onTabActivated({ tabId }) {
+  scheduleCapture(tabId);
+}
+
+// Registered at the top level, so a page load or tab switch can wake this worker.
+// With previews off, the listeners are removed again, so those events do not wake
+// it for nothing.
 chrome.tabs.onUpdated.addListener(onTabUpdated);
+chrome.tabs.onActivated.addListener(onTabActivated);
 
 async function syncPreviewListener() {
   previewsOn = null;
   const on = await arePreviewsOn();
-  const listening = chrome.tabs.onUpdated.hasListener(onTabUpdated);
-  if (on && !listening) chrome.tabs.onUpdated.addListener(onTabUpdated);
-  if (!on && listening) chrome.tabs.onUpdated.removeListener(onTabUpdated);
+  for (const [event, listener] of [
+    [chrome.tabs.onUpdated, onTabUpdated],
+    [chrome.tabs.onActivated, onTabActivated],
+  ]) {
+    const listening = event.hasListener(listener);
+    if (on && !listening) event.addListener(listener);
+    if (!on && listening) event.removeListener(listener);
+  }
+  // The tabs on screen now: a preview right away when they show a bookmarked site
+  if (on) {
+    const tabs = await chrome.tabs.query({ active: true }).catch(() => []);
+    for (const tab of tabs) scheduleCapture(tab.id);
+  }
 }
 syncPreviewListener();
 
@@ -269,6 +330,6 @@ chrome.permissions?.onRemoved?.addListener(syncPreviewListener);
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type !== "MAPLE_CAPTURE_PREVIEW" || !Number.isInteger(message.tabId)) return false;
   bookmarkedHosts = null;
-  capturePreview(message.tabId, true).then((captured) => sendResponse({ captured }));
+  queueCapture(message.tabId, true).then((captured) => sendResponse({ captured }));
   return true;
 });
