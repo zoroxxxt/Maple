@@ -214,21 +214,37 @@ setTimeout(() => {
 const noteTooltip = createNoteTooltip();
 const sitePreview = createSitePreview();
 
-// Page previews (opt-in): background.js saves the screenshots, this page only shows them
+// Page previews (opt-in): background.js saves the screenshots and share images,
+// this page shows them
 const PREVIEWS_KEY = "MAPLE_PREVIEWS";
 const ALL_URLS = { origins: ["<all_urls>"] };
 let previewsOn = false;
 chrome.storage.local.get(PREVIEWS_KEY).then(
   (result) => {
     previewsOn = result[PREVIEWS_KEY] === true;
+    watchPreviews();
   },
   () => {}
 );
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes[PREVIEWS_KEY]) return;
   previewsOn = changes[PREVIEWS_KEY].newValue === true;
-  if (!previewsOn) sitePreview.hide();
+  if (previewsOn) watchPreviews();
+  else sitePreview.forget();
 });
+// The permission can arrive after the setting turned on
+chrome.permissions?.onAdded?.addListener(() => watchPreviews());
+
+// Cards on screen get their preview ready before a hover (needs the permission too)
+function watchPreviews() {
+  if (!previewsOn) return;
+  chrome.permissions.contains(ALL_URLS).then(
+    (granted) => {
+      if (granted && previewsOn) sitePreview.watch(bookmarksRoot.querySelectorAll(".bookmark"));
+    },
+    () => {}
+  );
+}
 const noteEditor = createNoteEditor({ getNote, saveNote, onDelete: deleteBookmark });
 
 // Settings overlay: pop-up + sidebar içinde overlay olarak ayarlar paneli
@@ -253,7 +269,7 @@ const SETTINGS_OVERLAY = {
           "short-desc": "只显示网站名称（如 youtube），不显示完整网页标题。",
           "previews-title": "网页预览",
           "previews-desc":
-            "鼠标悬停卡片即可预览网站。打开已收藏的网站时，会在本机保存一张小截图；在此之前显示网站自己的分享图。",
+            "鼠标悬停卡片即可预览网站。打开已收藏的网站时，会在本机保存一张小截图。在此之前，卡片显示网站的分享图（不带 Cookie 下载一次）。",
           previewsStatus: (shots, images) => `已保存 ${shots} 张截图、${images} 张分享图。`,
           previewsEmpty: "还没有预览。打开一个已收藏的网站，或把鼠标移到卡片上。",
           previewsError: (message) => `截图失败：${message}`,
@@ -275,8 +291,9 @@ const SETTINGS_OVERLAY = {
           "short-desc": "Show only the site name, like youtube, instead of the full page title.",
           "previews-title": "Page Previews",
           "previews-desc":
-            "Hover a card to see the site. Opening a bookmarked site saves a small screenshot on this device. Until then, the site's own share image is shown.",
-          previewsStatus: (shots, images) => `Saved: ${shots} screenshots, ${images} share images.`,
+            "Hover a card to see the site. Opening a bookmarked site saves a small screenshot on this device. Until then, the card shows the site's share image, downloaded once without cookies.",
+          previewsStatus: (shots, images) =>
+            `Saved: ${shots} screenshot${shots === 1 ? "" : "s"}, ${images} share image${images === 1 ? "" : "s"}.`,
           previewsEmpty: "No previews yet. Open a bookmarked site, or hover a card.",
           previewsError: (message) => `Screenshot failed: ${message}`,
           "tips-title": "Hover Tooltips",
@@ -1309,6 +1326,7 @@ function renderBookmarkTree(bookmarkTreeNodes) {
   updateCollapseButton();
   updateBarBorders();
   updateFocusMode();
+  watchPreviews();
 }
 
 async function fetchBookmarkTree() {

@@ -1,21 +1,32 @@
 // Hover preview of a site, kept in IndexedDB on this device. Opt-in in the settings.
 // - "screenshot": background.js saves one when the user opens the site.
-// - "share-image": until then, the site's own share image (og:image), fetched once
-//   on hover from the site itself, without cookies.
+// - "share-image": until then, the site's own share image (og:image), which
+//   background.js downloads once, without cookies. Cards on screen get theirs
+//   before a hover, so the hover shows the preview at once.
 
 const DB = "maple-previews";
 const STORE = "previews";
-const SHOW_DELAY_MS = 450;
-const WIDTH = 480;
-// A site without a share image is asked again after a day
-const MISSING_RETRY_MS = 24 * 60 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 6000;
-// The share image is in <head>; never read more than this of a page
-const MAX_HTML_BYTES = 512 * 1024;
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+// The first preview waits a moment; while one is open, the next card follows fast
+const SHOW_DELAY_MS = 300;
+const WARM_DELAY_MS = 80;
+const WARM_MS = 400;
+// Share images are asked for again after two weeks, sites without one after three days
+const SHARE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const MISSING_RETRY_MS = 3 * 24 * 60 * 60 * 1000;
+// Share image requests that run at the same time
+const PARALLEL_REQUESTS = 3;
 
 // "www.example.com" and "example.com" are the same site (same rule as background.js)
 export const previewHost = (hostname) => hostname.toLowerCase().replace(/^www\./, "");
+
+function hostOf(pageUrl) {
+  try {
+    const url = new URL(pageUrl);
+    return url.protocol === "https:" || url.protocol === "http:" ? previewHost(url.hostname) : "";
+  } catch {
+    return "";
+  }
+}
 
 function openDb() {
   return new Promise((resolve, reject) => {
@@ -57,47 +68,12 @@ export async function countPreviews() {
   };
 }
 
-async function shrink(blob) {
-  const bitmap = await createImageBitmap(blob, { resizeWidth: WIDTH, resizeQuality: "medium" });
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  canvas.getContext("2d").drawImage(bitmap, 0, 0);
-  bitmap.close();
-  return canvas.convertToBlob({ type: "image/jpeg", quality: 0.72 });
-}
-
-async function readHead(response) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let html = "";
-  while (html.length < MAX_HTML_BYTES) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    html += decoder.decode(value, { stream: true });
-    if (/<\/head>/i.test(html)) break;
-  }
-  reader.cancel().catch(() => {});
-  return html;
-}
-
-// The site's share image, small, or null. The page is parsed with DOMParser,
-// which runs no scripts and loads nothing.
-async function fetchShareImage(pageUrl) {
-  const options = { credentials: "omit", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) };
-  const page = await fetch(pageUrl, options);
-  if (!page.ok || !(page.headers.get("content-type") || "").includes("text/html")) return null;
-  const doc = new DOMParser().parseFromString(await readHead(page), "text/html");
-  const meta = doc.querySelector(
-    'meta[property="og:image"], meta[property="og:image:url"], meta[name="twitter:image"], meta[name="twitter:image:src"]'
-  );
-  const content = meta?.getAttribute("content");
-  if (!content) return null;
-  const imageUrl = new URL(content, page.url);
-  if (imageUrl.protocol !== "https:" && imageUrl.protocol !== "http:") return null;
-  const image = await fetch(imageUrl, options);
-  if (!image.ok) return null;
-  const blob = await image.blob();
-  if (!blob.type.startsWith("image/") || blob.size > MAX_IMAGE_BYTES) return null;
-  return shrink(blob);
+// True when a site has no preview yet, or its share image is old
+function needsShareImage(saved) {
+  if (!saved) return true;
+  if (saved.source === "screenshot") return false;
+  const maxAge = saved.source === "share-image" ? SHARE_MAX_AGE_MS : MISSING_RETRY_MS;
+  return Date.now() - saved.capturedAt > maxAge;
 }
 
 export function createSitePreview() {
@@ -110,10 +86,19 @@ export function createSitePreview() {
 
   // host -> { url, capturedAt }: object URLs for this page's lifetime
   const urls = new Map();
-  // Share image requests that are running, per host
-  const loading = new Map();
+  // host -> share image request to background.js, waiting, running or done
+  const requests = new Map();
+  const queue = [];
+  let running = 0;
+  // host -> { source, capturedAt } of the saved previews, read once
+  let known = null;
+  let knownLoad = null;
+  let observer = null;
+  // Changes when the previews are turned off, so that late work stops
+  let generation = 0;
   let timer = 0;
   let current = null;
+  let hiddenAt = 0;
 
   // Below the card, or above it when there is no room, and inside the window
   function position(anchor) {
@@ -130,42 +115,74 @@ export function createSitePreview() {
     el.style.top = `${Math.round(Math.max(margin, top))}px`;
   }
 
-  async function loadShareImage(host, pageUrl) {
-    if (!loading.has(host)) {
-      const task = fetchShareImage(pageUrl)
+  function runQueue() {
+    while (running < PARALLEL_REQUESTS && queue.length) {
+      const job = queue.shift();
+      running++;
+      chrome.runtime
+        .sendMessage({ type: "MAPLE_SHARE_IMAGE", url: job.url })
         .catch(() => null)
-        .then(async (blob) => {
-          const record = blob
-            ? { host, blob, capturedAt: Date.now(), source: "share-image" }
-            : { host, capturedAt: Date.now(), source: "none" };
-          // A screenshot that background.js saved in the meantime wins
-          const saved = await withStore("readwrite", (store) => {
-            const request = store.get(host);
-            request.onsuccess = () => {
-              if (request.result?.source !== "screenshot") store.put(record);
-            };
-            return request;
-          }).catch(() => null);
-          return saved?.source === "screenshot" ? saved : record;
-        })
-        .finally(() => loading.delete(host));
-      loading.set(host, task);
+        .then((saved) => {
+          if (saved) known?.set(job.host, saved);
+          // After an error, the next hover or render asks again
+          else if (requests.get(job.host) === job) requests.delete(job.host);
+          job.resolve(saved);
+          running--;
+          runQueue();
+        });
     }
-    return loading.get(host);
+  }
+
+  // Asks background.js for a site's share image. A hover goes to the front of the line.
+  function request(host, url, urgent) {
+    let job = requests.get(host);
+    if (!job) {
+      job = { host, url };
+      job.done = new Promise((resolve) => (job.resolve = resolve));
+      requests.set(host, job);
+      queue.push(job);
+    }
+    const index = queue.indexOf(job);
+    if (urgent && index > 0) queue.unshift(...queue.splice(index, 1));
+    runQueue();
+    return job.done;
+  }
+
+  function loadKnown() {
+    knownLoad ||= withStore("readonly", (store) => store.getAll())
+      .catch(() => [])
+      .then((all) => {
+        known = new Map(all.map((item) => [item.host, { source: item.source, capturedAt: item.capturedAt }]));
+        return known;
+      });
+    return knownLoad;
+  }
+
+  // Cards that come on screen get their share image before a hover
+  async function onCardsVisible(entries, watcher) {
+    const cards = entries.filter((entry) => entry.isIntersecting).map((entry) => entry.target);
+    if (!cards.length) return;
+    for (const card of cards) watcher.unobserve(card);
+    const started = generation;
+    const saved = await loadKnown();
+    if (started !== generation) return;
+    for (const card of cards) {
+      const url = card.getAttribute("href");
+      const host = hostOf(url);
+      if (host && needsShareImage(saved.get(host))) request(host, url, false);
+    }
   }
 
   async function urlFor(pageUrl) {
-    let host;
-    try {
-      host = previewHost(new URL(pageUrl).hostname);
-    } catch {
-      return null;
-    }
-    if (!host || !/^https?:/i.test(pageUrl)) return null;
+    const host = hostOf(pageUrl);
+    if (!host) return null;
     // Read again each time: background.js can save a newer screenshot while this page is open
-    let record = await withStore("readonly", (store) => store.get(host)).catch(() => null);
-    const missingRecently = record?.source === "none" && Date.now() - record.capturedAt < MISSING_RETRY_MS;
-    if (!record?.blob && !missingRecently) record = await loadShareImage(host, pageUrl);
+    const read = () => withStore("readonly", (store) => store.get(host)).catch(() => null);
+    let record = await read();
+    if (!record?.blob && needsShareImage(record)) {
+      await request(host, pageUrl, true);
+      record = await read();
+    }
     if (!record?.blob) return null;
     const cached = urls.get(host);
     if (cached?.capturedAt === record.capturedAt) return cached.url;
@@ -178,6 +195,7 @@ export function createSitePreview() {
   function hide() {
     clearTimeout(timer);
     current = null;
+    if (el.classList.contains("show")) hiddenAt = Date.now();
     el.classList.remove("show");
   }
 
@@ -185,20 +203,37 @@ export function createSitePreview() {
     show(anchor, pageUrl) {
       clearTimeout(timer);
       current = anchor;
-      timer = setTimeout(async () => {
-        const url = await urlFor(pageUrl);
-        if (!url || current !== anchor) return;
-        img.src = url;
-        await img.decode().catch(() => {});
-        if (current !== anchor) return;
-        position(anchor);
-        el.classList.add("show");
-      }, SHOW_DELAY_MS);
+      const warm = el.classList.contains("show") || Date.now() - hiddenAt < WARM_MS;
+      timer = setTimeout(
+        async () => {
+          const url = await urlFor(pageUrl);
+          if (!url || current !== anchor) return;
+          img.src = url;
+          await img.decode().catch(() => {});
+          if (current !== anchor) return;
+          position(anchor);
+          el.classList.add("show");
+        },
+        warm ? WARM_DELAY_MS : SHOW_DELAY_MS
+      );
     },
     hide,
-    // After the saved previews were deleted
+    // Watches these cards: the ones on screen get their share image before a hover
+    watch(cards) {
+      observer?.disconnect();
+      observer = new IntersectionObserver(onCardsVisible, { rootMargin: "200px 0px" });
+      for (const card of cards) observer.observe(card);
+    },
+    // After the setting was turned off or the saved previews were deleted
     forget() {
       hide();
+      generation++;
+      observer?.disconnect();
+      observer = null;
+      for (const job of queue.splice(0)) job.resolve(null);
+      requests.clear();
+      known = null;
+      knownLoad = null;
       for (const { url } of urls.values()) URL.revokeObjectURL(url);
       urls.clear();
     },

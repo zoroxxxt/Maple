@@ -127,7 +127,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Opt-in (setting + the optional "<all_urls>" permission). When the user opens or
 // switches to a bookmarked site, take one small screenshot of the visible tab and
 // keep it in IndexedDB on this device. Cards show it on hover (utils/site-preview.js).
-// No network requests here; at most one screenshot per site every few days.
+// At most one screenshot per site every few days. Until a site has one, its card
+// shows the site's share image, which this worker downloads once (see below).
 const PREVIEWS_KEY = "MAPLE_PREVIEWS";
 // The last screenshot error, shown in the settings ("" after a success)
 const PREVIEW_ERROR_KEY = "MAPLE_PREVIEW_ERROR";
@@ -138,6 +139,15 @@ const PREVIEW_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 // Wait for the page to finish drawing after "complete" or a tab switch
 const PREVIEW_DELAY_MS = 1500;
 const CAPTURE_GAP_MS = 600;
+const PREVIEW_MAX_HEIGHT = 640;
+// Share images (og:image): never read more than this of a page or an image
+const SHARE_MAX_HTML_LENGTH = 512 * 1024;
+const SHARE_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+// A smaller image is an icon, not a picture of the site
+const SHARE_MIN_WIDTH = 200;
+const SHARE_TIMEOUT_MS = 8000;
+const SHARE_IMAGE_KEYS = ["og:image", "og:image:url", "og:image:secure_url"];
+const SHARE_IMAGE_FALLBACK_KEYS = ["twitter:image", "twitter:image:src"];
 const ALL_URLS = { origins: ["<all_urls>"] };
 
 let previewsOn = null;
@@ -209,14 +219,28 @@ for (const eventName of ["onCreated", "onRemoved", "onChanged", "onImportEnded"]
   });
 }
 
-// The full screenshot is the size of the window (often 2x); keep a small JPEG
+// A small JPEG, 480px wide and at most 640px high (a taller image keeps its top).
+// Transparent parts turn white. Null for an image narrower than minWidth.
+async function shrinkImage(blob, minWidth = 0) {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    if (bitmap.width < minWidth) return null;
+    const height = Math.round((bitmap.height * PREVIEW_WIDTH) / bitmap.width);
+    const canvas = new OffscreenCanvas(PREVIEW_WIDTH, Math.min(height, PREVIEW_MAX_HEIGHT));
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#fff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.imageSmoothingQuality = "high";
+    context.drawImage(bitmap, 0, 0, PREVIEW_WIDTH, height);
+    return await canvas.convertToBlob({ type: "image/jpeg", quality: 0.72 });
+  } finally {
+    bitmap.close();
+  }
+}
+
+// The full screenshot is the size of the window (often 2x)
 async function shrinkScreenshot(dataUrl) {
-  const source = await (await fetch(dataUrl)).blob();
-  const bitmap = await createImageBitmap(source, { resizeWidth: PREVIEW_WIDTH, resizeQuality: "medium" });
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  canvas.getContext("2d").drawImage(bitmap, 0, 0);
-  bitmap.close();
-  return canvas.convertToBlob({ type: "image/jpeg", quality: 0.72 });
+  return shrinkImage(await (await fetch(dataUrl)).blob());
 }
 
 // The preview host of a tab that shows a web page, or ""
@@ -331,5 +355,166 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type !== "MAPLE_CAPTURE_PREVIEW" || !Number.isInteger(message.tabId)) return false;
   bookmarkedHosts = null;
   queueCapture(message.tabId, true).then((captured) => sendResponse({ captured }));
+  return true;
+});
+
+// ---- Share images ----
+// The picture that a site gives for link previews (og:image or twitter:image).
+// Downloaded here and not in the page: a page would also load the fonts and styles
+// that a site names in its "Link: rel=preload" response headers.
+
+const ENTITIES = { amp: "&", quot: '"', apos: "'", lt: "<", gt: ">" };
+function decodeEntities(text) {
+  return text.replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+);/gi, (entity, code) => {
+    if (code[0] !== "#") return ENTITIES[code.toLowerCase()] ?? entity;
+    const point = /^#x/i.test(code) ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+    return point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+  });
+}
+
+// The attributes of one tag, for example <meta property="og:image" content="...">
+function tagAttributes(tag) {
+  const attributes = new Map();
+  const start = tag.search(/\s/);
+  if (start < 0) return attributes;
+  const pattern = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+  pattern.lastIndex = start;
+  for (let match; (match = pattern.exec(tag));) {
+    const name = match[1].toLowerCase();
+    if (!attributes.has(name)) attributes.set(name, match[2] ?? match[3] ?? match[4] ?? "");
+  }
+  return attributes;
+}
+
+// The share image URL of a page, or "". The page is read as text and never parsed
+// into a document, so nothing in it loads. Reading stops at the og:image tag.
+async function findShareImageUrl(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const metaTag = /<meta\b[^>]*>/gi;
+  let html = "";
+  let fallback = "";
+  try {
+    while (html.length < SHARE_MAX_HTML_LENGTH) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      html += decoder.decode(value, { stream: true });
+      // A tag that is cut at the end of this part matches with the next part
+      for (let match; (match = metaTag.exec(html));) {
+        const attributes = tagAttributes(match[0]);
+        const key = (attributes.get("property") || attributes.get("name") || "").toLowerCase();
+        const content = attributes.get("content")?.trim();
+        if (!content) continue;
+        if (SHARE_IMAGE_KEYS.includes(key)) return content;
+        if (!fallback && SHARE_IMAGE_FALLBACK_KEYS.includes(key)) fallback = content;
+      }
+      // Some sites put the tags in <body>; read on only when there is nothing yet
+      if (fallback && /<\/head\s*>/i.test(html)) break;
+      metaTag.lastIndex = Math.max(0, html.lastIndexOf("<"));
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  return fallback;
+}
+
+// Intranet names and IP addresses (the same rule as utils/favicon.js)
+function isPrivateHost(host) {
+  return (
+    !host.includes(".") ||
+    host.startsWith("[") ||
+    /^[\d.]+$/.test(host) ||
+    /\.(local|localhost|internal|intranet|lan|home|corp|test|invalid|home\.arpa)$/.test(host)
+  );
+}
+
+// The share image of a page as a small JPEG, or null when the page has none.
+// Throws when the site does not answer, so that a later hover asks again.
+async function fetchShareImage(pageUrl) {
+  const options = { credentials: "omit", signal: AbortSignal.timeout(SHARE_TIMEOUT_MS) };
+  const page = await fetch(pageUrl, options);
+  if (page.status >= 500) throw new Error(`HTTP ${page.status}`);
+  if (!page.ok || !(page.headers.get("content-type") || "").includes("html")) return null;
+  const content = await findShareImageUrl(page);
+  if (!content) return null;
+  let imageUrl;
+  try {
+    imageUrl = new URL(decodeEntities(content), page.url);
+  } catch {
+    return null;
+  }
+  if (imageUrl.protocol !== "https:" && imageUrl.protocol !== "http:") return null;
+  // A public site cannot send the extension to the local network
+  if (isPrivateHost(imageUrl.hostname) && !isPrivateHost(new URL(page.url).hostname)) return null;
+  const image = await fetch(imageUrl, options);
+  if (image.status >= 500) throw new Error(`HTTP ${image.status}`);
+  if (!image.ok || Number(image.headers.get("content-length")) > SHARE_MAX_IMAGE_BYTES) return null;
+  const blob = await image.blob();
+  if (blob.size > SHARE_MAX_IMAGE_BYTES) return null;
+  // Not an image the browser can draw (for example SVG here)
+  return shrinkImage(blob, SHARE_MIN_WIDTH).catch(() => null);
+}
+
+// Reads and writes one site's record in one transaction, so that a screenshot
+// saved at the same moment is never lost
+async function updatePreview(host, update) {
+  const db = await openPreviewDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(PREVIEW_STORE, "readwrite");
+      const store = tx.objectStore(PREVIEW_STORE);
+      const request = store.get(host);
+      let record;
+      request.onsuccess = () => {
+        record = update(request.result);
+        if (record !== request.result) store.put(record);
+      };
+      tx.oncomplete = () => resolve(record);
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+// host -> running download, so that the popup and the sidebar share one
+const shareImageTasks = new Map();
+
+// Saves the share image of a bookmarked site, unless the site has a screenshot.
+// Returns { source, capturedAt } of what is saved now, or null after an error.
+function saveShareImage(pageUrl) {
+  let host;
+  try {
+    const url = new URL(pageUrl);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return Promise.resolve(null);
+    host = previewHost(url.hostname);
+  } catch {
+    return Promise.resolve(null);
+  }
+  if (!shareImageTasks.has(host)) {
+    const task = (async () => {
+      if (!(await arePreviewsOn()) || !(await getBookmarkedHosts()).has(host)) return null;
+      const blob = await fetchShareImage(pageUrl);
+      const now = Date.now();
+      const record = await updatePreview(host, (saved) => {
+        if (saved?.source === "screenshot") return saved;
+        if (blob) return { host, blob, capturedAt: now, source: "share-image" };
+        // The site has no share image now: keep the old one, if any
+        if (saved?.blob) return { ...saved, capturedAt: now };
+        return { host, capturedAt: now, source: "none" };
+      });
+      return { source: record.source, capturedAt: record.capturedAt };
+    })()
+      .catch(() => null)
+      .finally(() => shareImageTasks.delete(host));
+    shareImageTasks.set(host, task);
+  }
+  return shareImageTasks.get(host);
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "MAPLE_SHARE_IMAGE" || typeof message.url !== "string") return false;
+  if (sender.id !== chrome.runtime.id) return false;
+  saveShareImage(message.url).then(sendResponse);
   return true;
 });
